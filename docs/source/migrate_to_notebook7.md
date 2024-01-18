@@ -1,83 +1,171 @@
-# Migrating to Notebook 7
+import logging
+import numpy
+import os
+import time
 
-_Updated 2023-05-17_
+from contextlib import closing
+from six.moves import cPickle
 
-```{warning}
-Version 7 of the Jupyter Notebook application might break your
-extensions or other customizations. Please read this page to find out if you
-need to take any actions to ensure a smooth, uninterrupted experience.
-```
+from blocks.extensions.saveload import SAVED_TO, LOADED_FROM
+from blocks.extensions import TrainingExtension, SimpleExtension
+from blocks.serialization import secure_dump, load, BRICK_DELIMITER
+from blocks.utils import reraise_as
 
-A major upgrade to the Jupyter Notebook interface is coming with Notebook 7! This
-upgrade will bring a heap of new features, but will also break backwards
-compatibility with many classic Notebook features and customizations.
+logger = logging.getLogger(__name__)
 
-This set of guides is here to help you migrate your Classic Notebook setup and
-extensions to the new Notebook 7.
 
-## What you need to do
+class SaveLoadUtils(object):
+    """Utility class for checkpointing."""
 
-For users who don't use extensions or other customizations, you will seamlessly
-receive the new Notebook 7 when you `pip install notebook` once version 7 is
-released out of beta, along with all its new features, like realtime
-collaboration, debugger, and theming.
+    @property
+    def path_to_folder(self):
+        return self.folder
 
-For users who need to use extensions or other customizations, you have a couple
-of options:
+    @property
+    def path_to_parameters(self):
+        return os.path.join(self.folder, 'params.npz')
 
-- Look for Notebook 7 compatible versions of the extensions you already use,
-  and [find replacements for those that are not available]
+    @property
+    def path_to_iteration_state(self):
+        return os.path.join(self.folder, 'iterations_state.pkl')
 
-- If you need to maintain compatibility with the Classic Notebook for extensions
-  or other customizations that are critical to your workflows, you can switch to
-  [nbclassic], which will provide compatibility with the old notebook interface
-  and support during an intermediate transition period to Notebook 7
+    @property
+    def path_to_log(self):
+        return os.path.join(self.folder, 'log')
 
-## Why a new version?
+    def load_parameter_values(self, path):
+        with closing(numpy.load(path)) as source:
+            param_values = {}
+            for name, value in source.items():
+                if name != 'pkl':
+                    name_ = name.replace(BRICK_DELIMITER, '/')
+                    if not name_.startswith('/'):
+                        name_ = '/' + name_
+                    param_values[name_] = value
+        return param_values
 
-For the past few years, the Classic Jupyter Notebook has been in maintenance
-mode.
+    def save_parameter_values(self, param_values, path):
+        param_values = {name.replace("/", BRICK_DELIMITER): param
+                        for name, param in param_values.items()}
+        numpy.savez(path, **param_values)
 
-Development has mostly moved to alternative user interfaces like JupyterLab,
-which is a more modern and extensible web application. This has resulted in
-a lot of new features and improvements in JupyterLab, but also in a lot of
-new features and improvements that were not possible to integrate to the
-Classic Notebook.
 
-For a while, the plan was to progressively _sunset_ the Classic Notebook and
-not maintain it anymore. However, the Classic Notebook is still widely used
-and it is still the default user interface for Jupyter in many scenarios.
-Many users and organizations have not been able to switch to JupyterLab yet.
-For some users, JupyterLab can also be a more complex environment to use,
-especially for beginners.
+class CheckpointNMT(SimpleExtension, SaveLoadUtils):
+    """Redefines checkpointing for NMT.
 
-Following the feedback from the community, it was decided in late 2021 to
-continue developing the Jupyter Notebook application and _sunrise_ it as
-Notebook 7.
+        Saves only parameters (npz), iteration state (pickle) and log (pickle).
 
-You can find more details about the changes currently taking place in the
-Jupyter Ecosystem in the [JEP 79] and [team-compass note].
+    """
 
-## New features in Notebook 7
+    def __init__(self, saveto, **kwargs):
+        self.folder = saveto
+        kwargs.setdefault("after_training", True)
+        super(CheckpointNMT, self).__init__(**kwargs)
 
-```{toctree}
-:maxdepth: 2
+    def dump_parameters(self, main_loop):
+        params_to_save = main_loop.model.get_parameter_values()
+        self.save_parameter_values(params_to_save,
+                                   self.path_to_parameters)
 
-notebook_7_features.md
-```
+    def dump_iteration_state(self, main_loop):
+        secure_dump(main_loop.iteration_state, self.path_to_iteration_state) 
 
-## Migration Guides
+    def dump_log(self, main_loop):
+        secure_dump(main_loop.log, self.path_to_log, cPickle.dump)
 
-```{toctree}
-:maxdepth: 2
+    def dump(self, main_loop):
+        if not os.path.exists(self.path_to_folder):
+            os.mkdir(self.path_to_folder)
+        print("")
+        logger.info(" Saving model")
+        start = time.time()
+        logger.info(" ...saving parameters")
+        self.dump_parameters(main_loop)
+        logger.info(" ...saving iteration state")
+        self.dump_iteration_state(main_loop)
+        logger.info(" ...saving log")
+        self.dump_log(main_loop)
+        logger.info(" Model saved, took {} seconds.".format(time.time()-start))
 
-migrating/frontend-extensions.md
-migrating/server-extensions.md
-migrating/custom-themes.md
-migrating/multiple-interfaces.md
-```
+    def do(self, callback_name, *args):
+        try:
+            self.dump(self.main_loop)
+        except Exception:
+            raise
+        finally:
+            already_saved_to = self.main_loop.log.current_row.get(SAVED_TO, ())
+            self.main_loop.log.current_row[SAVED_TO] = (already_saved_to +
+                                                        (self.path_to_folder +
+                                                            'params.npz',))
 
-[jep 79]: https://jupyter.org/enhancement-proposals/79-notebook-v7/notebook-v7.html
-[team-compass note]: https://github.com/jupyter/notebook-team-compass/issues/5#issuecomment-1085254000
-[find replacements for those that are not available]: https://jupyter-notebook.readthedocs.io/en/latest/migrating/frontend-extensions.html#jupyterlab-equivalent-extensions-to-the-classic-notebook
-[nbclassic]: https://github.com/jupyter/nbclassic
+
+class LoadNMT(TrainingExtension, SaveLoadUtils):
+    """Loads parameters log and iterations state."""
+
+    def __init__(self, saveto, **kwargs):
+        self.folder = saveto
+        super(LoadNMT, self).__init__(saveto, **kwargs)
+
+    def before_training(self):
+        if not os.path.exists(self.path_to_folder):
+            logger.info("No dump found")
+            return
+        logger.info("Loading the state from {} into the main loop"
+                    .format(self.path_to_folder))
+        try:
+            self.load_to(self.main_loop)
+            self.main_loop.log.current_row[LOADED_FROM] = self.path_to_folder
+        except Exception:
+            reraise_as("Failed to load the state")
+
+    def load_parameters(self):
+        return self.load_parameter_values(self.path_to_parameters)
+
+    def load_iteration_state(self):
+        with open(self.path_to_iteration_state, "rb") as source: 
+            return load(source, use_cpickle=True)
+
+    def load_log(self):
+        with open(self.path_to_log, "rb") as source:
+            return cPickle.load(source)
+
+    def load_to(self, main_loop):
+        """Loads the dump from the root folder into the main loop."""
+        logger.info(" Reloading model")
+        try:
+            logger.info(" ...loading model parameters")
+            params_all = self.load_parameters()
+            params_this = main_loop.model.get_parameter_dict()
+            missing = set(params_this.keys()) - set(params_all.keys())
+            for pname in params_this.keys():
+                if pname in params_all:
+                    val = params_all[pname]
+                    if params_this[pname].get_value().shape != val.shape:
+                        logger.warning(
+                            " Dimension mismatch {}-{} for {}"
+                            .format(params_this[pname].get_value().shape,
+                                    val.shape, pname))
+
+                    params_this[pname].set_value(val)
+                    logger.info(" Loaded to CG {:15}: {}"
+                                .format(str(val.shape), pname))
+                else:
+                    logger.warning(
+                        " Parameter does not exist: {}".format(pname))
+            logger.info(
+                " Number of parameters loaded for computation graph: {}"
+                .format(len(params_this) - len(missing)))
+        except Exception as e:
+            logger.error(" Error {0}".format(str(e)))
+
+        try:
+            logger.info(" Loading iteration state...")
+            main_loop.iteration_state = self.load_iteration_state()
+        except Exception as e:
+            logger.error(" Error {0}".format(str(e)))
+
+        try:
+            logger.info(" Loading log...")
+            main_loop.log = self.load_log()
+        except Exception as e:
+            logger.error(" Error {0}".format(str(e)))
